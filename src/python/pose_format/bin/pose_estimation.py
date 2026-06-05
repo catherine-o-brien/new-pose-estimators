@@ -69,7 +69,8 @@ def pose_video(input_path: str, output_path: str, format: str, use_cpu: bool, ad
                             fps=fps,
                             use_cpu=use_cpu,
                             width=width,
-                            height=height)
+                            height=height,
+                            additional_config=additional_config)
     else:
         raise NotImplementedError('Pose format not supported')
 
