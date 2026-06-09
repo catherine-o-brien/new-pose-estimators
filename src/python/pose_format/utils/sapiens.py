@@ -1,4 +1,5 @@
 import json
+import os
 import numpy as np
 import cv2
 import torch
@@ -354,15 +355,42 @@ def load_sapiens_wholebody_from_json(
 
 # HuggingFace's "main" branch of facebook/sapiens-pose-1b-torchscript currently
 # 404s on the .pt2 file, so pin to a known-good commit (matches install_sapiens.sh
-# in multimodalhugs-pipelines).
+# in multimodalhugs-pipelines). This commit lives in the 1B repo only, so the pin
+# must NOT be applied to the 0.3B/0.6B repos (they download from their default branch).
+_SAPIENS_1B_REPO = "facebook/sapiens-pose-1b-torchscript"
 _SAPIENS_HF_REVISION = "4caa2b2290255dc8963b5ead35fe3c6e761742aa"
-_SAPIENS_POSE_FILE = "sapiens_1b_goliath_best_goliath_AP_640_torchscript.pt2"
-_SAPIENS_POSE_REPO = "facebook/sapiens-pose-1b-torchscript"
+
+# Upstream sapiens_inference points the 1B enum at the AP_640 file, which exists
+# only at the pinned revision above; Meta retrained the model and renamed it to
+# AP_639 on `main`. We pre-download AP_640 from the pin, then hand AP_639 to
+# sapiens_inference's own loader (which builds a `main`-branch URL). Keep both
+# values explicit so the pre-download stays correct even if the (shared) enum
+# value was already patched on a previous call. Remove both once
+# ibaiGorordo/Sapiens-Pytorch-Inference is updated.
+_SAPIENS_1B_PINNED_VALUE = "sapiens-pose-1b-torchscript/sapiens_1b_goliath_best_goliath_AP_640_torchscript.pt2"
+_SAPIENS_1B_MAIN_VALUE = "sapiens-pose-1b-torchscript/sapiens_1b_goliath_best_goliath_AP_639_torchscript.pt2"
+
+# Some non-1B sizes' upstream enum filenames also don't match what's published on
+# HF. Override with the actual filenames (verified against the repos); these live
+# on each repo's default branch, so no revision pin is needed. 0.3B already matches
+# upstream (AP_573). Remove once ibaiGorordo/Sapiens-Pytorch-Inference is updated.
+_SAPIENS_POSE_FILE_OVERRIDE = {
+    "0.6b": "sapiens-pose-0.6b-torchscript/sapiens_0.6b_goliath_best_goliath_AP_609_torchscript.pt2",
+}
+
+# Maps model_size values to SapiensPoseEstimationType attribute names.
+_SAPIENS_MODEL_SIZE_MAP = {
+    "0.3b": "POSE_ESTIMATION_03B",
+    "0.6b": "POSE_ESTIMATION_06B",
+    "1b": "POSE_ESTIMATION_1B",
+}
 
 
 def _pin_sapiens_hf_revision():
     """
-    Force any hf_hub_download call for facebook/sapiens-* to use the pinned revision.
+    Force hf_hub_download calls for the 1B repo to use the pinned revision (its
+    `main` branch 404s on the .pt2). Other sizes (0.3B/0.6B) are left untouched so
+    they resolve from their own default branch.
     Patches both huggingface_hub.hf_hub_download (for future imports) and any
     already-imported references inside sapiens_inference.* submodules.
     """
@@ -372,7 +400,7 @@ def _pin_sapiens_hf_revision():
     def _wrap(original):
         def _patched(*args, **kwargs):
             repo_id = kwargs.get("repo_id") or (args[0] if args else "")
-            if isinstance(repo_id, str) and repo_id.startswith("facebook/sapiens-"):
+            if repo_id == _SAPIENS_1B_REPO:
                 kwargs.setdefault("revision", _SAPIENS_HF_REVISION)
             return original(*args, **kwargs)
         _patched._sapiens_pinned = True
@@ -389,29 +417,48 @@ def _pin_sapiens_hf_revision():
             module.hf_hub_download = _wrap(fn)
 
 
-def _ensure_sapiens_model_and_cwd():
+def _resolve_pose_type(SapiensPoseEstimationType, model_size: str = "1b"):
+    """Validate *model_size* ('0.3b', '0.6b', '1b') and return the matching enum member."""
+    size = model_size.lower()
+    if size not in _SAPIENS_MODEL_SIZE_MAP:
+        raise ValueError(
+            f"Invalid model_size={model_size!r}. Valid values: {sorted(_SAPIENS_MODEL_SIZE_MAP)}"
+        )
+    return getattr(SapiensPoseEstimationType, _SAPIENS_MODEL_SIZE_MAP[size])
+
+
+def _ensure_sapiens_model_and_cwd(model_type):
     """
     Mirrors install_sapiens.sh: download the Sapiens pose model into
     <sapiens_repo>/models/<file> (with the pinned revision) and chdir to the
     repo root so SapiensPoseEstimation's relative model paths resolve.
+
+    The file name and HuggingFace repo are derived from the (potentially patched)
+    enum value, whose format is "<repo-slug>/<filename>.pt2".
     """
-    import os
     import shutil
     import sapiens_inference
+
+    repo_slug, pose_file = model_type.value.rsplit("/", 1)
+    pose_repo = f"facebook/{repo_slug}"
+
+    # Only the 1B repo needs the pinned revision; other sizes resolve from their
+    # default branch (revision=None).
+    revision = _SAPIENS_HF_REVISION if pose_repo == _SAPIENS_1B_REPO else None
 
     pkg_path = os.path.dirname(os.path.abspath(sapiens_inference.__file__))
     repo_root = os.path.dirname(pkg_path)
     models_dir = os.path.join(repo_root, "models")
-    target = os.path.join(models_dir, _SAPIENS_POSE_FILE)
+    target = os.path.join(models_dir, pose_file)
 
     if not os.path.isfile(target):
         os.makedirs(models_dir, exist_ok=True)
         print("Downloading Sapiens pose model...")
         from huggingface_hub import hf_hub_download
         src = hf_hub_download(
-            repo_id=_SAPIENS_POSE_REPO,
-            filename=_SAPIENS_POSE_FILE,
-            revision=_SAPIENS_HF_REVISION,
+            repo_id=pose_repo,
+            filename=pose_file,
+            revision=revision,
         )
         shutil.copy(src, target)
 
@@ -420,7 +467,7 @@ def _ensure_sapiens_model_and_cwd():
         os.chdir(repo_root)
 
 
-def _lazy_import_sapiens_inference():
+def _lazy_import_sapiens_inference(model_size: str = "1b"):
     _pin_sapiens_hf_revision()
     try:
         from sapiens_inference.pose import SapiensPoseEstimation, SapiensPoseEstimationType
@@ -431,8 +478,25 @@ def _lazy_import_sapiens_inference():
                                "git+https://github.com/ibaiGorordo/Sapiens-Pytorch-Inference.git"])
         from sapiens_inference.pose import SapiensPoseEstimation, SapiensPoseEstimationType
     _pin_sapiens_hf_revision()
-    _ensure_sapiens_model_and_cwd()
-    return SapiensPoseEstimation, SapiensPoseEstimationType
+    size = model_size.lower()
+    model_type = _resolve_pose_type(SapiensPoseEstimationType, model_size)
+
+    if size == "1b":
+        # Pre-download AP_640 from the pinned revision (the only place it exists),
+        # then point the enum at AP_639 on `main` for sapiens_inference's loader.
+        # Setting the pinned value first keeps the pre-download correct even if a
+        # previous call already patched this shared enum member to AP_639.
+        model_type._value_ = _SAPIENS_1B_PINNED_VALUE
+        _ensure_sapiens_model_and_cwd(model_type)
+        model_type._value_ = _SAPIENS_1B_MAIN_VALUE
+    else:
+        # Other sizes download from their default branch; correct the filename
+        # first if upstream's enum value doesn't match what's published on HF.
+        if size in _SAPIENS_POSE_FILE_OVERRIDE:
+            model_type._value_ = _SAPIENS_POSE_FILE_OVERRIDE[size]
+        _ensure_sapiens_model_and_cwd(model_type)
+
+    return SapiensPoseEstimation, model_type
 
 
 def _get_device(use_cpu: bool):
@@ -445,22 +509,14 @@ def _get_device(use_cpu: bool):
     return torch.device("cpu"), torch.float32
 
 
-def _sapiens_frames_to_json(frames, use_cpu: bool):
+def _sapiens_frames_to_json(frames, use_cpu: bool, model_size: str = "1b"):
     """Yield per-frame {'frame': idx, 'keypoints': {name: [x, y, score]}} dicts."""
-    SapiensPoseEstimation, SapiensPoseEstimationType = _lazy_import_sapiens_inference()
-
-    # Upstream sapiens_inference hardcodes the 1B torchscript filename as AP_640, but
-    # Meta retrained the model and the file on HuggingFace is now AP_639. Patch the
-    # enum value so download_hf_model constructs a URL that actually resolves.
-    # Remove this once https://github.com/ibaiGorordo/Sapiens-Pytorch-Inference is updated.
-    SapiensPoseEstimationType.POSE_ESTIMATION_1B._value_ = (
-        "sapiens-pose-1b-torchscript/sapiens_1b_goliath_best_goliath_AP_639_torchscript.pt2"
-    )
+    SapiensPoseEstimation, model_type = _lazy_import_sapiens_inference(model_size)
 
     device, dtype = _get_device(use_cpu)
     print(f"Loading Sapiens model on {device} ({dtype})...")
     estimator = SapiensPoseEstimation(
-        type=SapiensPoseEstimationType.POSE_ESTIMATION_1B,
+        type=model_type,
         device=device,
         dtype=dtype,
     )
@@ -483,8 +539,14 @@ def estimate_and_load_sapiens(frames,
                               fps: float = 24,
                               use_cpu: bool = False,
                               width: int = 1000,
-                              height: int = 1000) -> Pose:
-    """Estimate pose with Sapiens on RGB frames and return a Pose object."""
+                              height: int = 1000,
+                              additional_config={}) -> Pose:
+    """Estimate pose with Sapiens on RGB frames and return a Pose object.
+
+    The model size is read from additional_config['model_size'] ('0.3b', '0.6b',
+    or '1b'; default '1b'), e.g. --additional-config="model_size=0.3b".
+    """
     print("Loading pose with Sapiens...")
-    frame_entries = list(_sapiens_frames_to_json(frames, use_cpu=use_cpu))
+    model_size = additional_config.get('model_size', '1b')
+    frame_entries = list(_sapiens_frames_to_json(frames, use_cpu=use_cpu, model_size=model_size))
     return _sapiens_json_to_pose(frame_entries, fps=fps, width=width, height=height)
